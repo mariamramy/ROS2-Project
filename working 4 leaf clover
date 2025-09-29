@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""
+turtle_commander.py
+
+Listens on 'shape' (std_msgs/String). When a shape name arrives ("clover", "heart", "spiral")
+it generates a sequence of (x,y) waypoints for that parametric shape, scales & recenters them
+to fit the turtlesim 11x11 world, clamps coordinates to [0,11], and drives the turtle along the
+waypoints by publishing geometry_msgs/Twist commands.
+
+Works with ROS2 (rclpy) and turtlesim (turtle named 'turtle1').
+"""
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import String
+from geometry_msgs.msg import Twist
+from turtlesim.msg import Pose
+import math
+import threading
+import time
+
+WORLD_MIN = 0.0
+WORLD_MAX = 11.0
+WORLD_CENTER_X = (WORLD_MAX + WORLD_MIN) / 2.0
+WORLD_CENTER_Y = (WORLD_MAX + WORLD_MIN) / 2.0
+
+def clamp(v, a, b):
+    return max(a, min(b, v))
+
+class TurtleCommander(Node):
+    def __init__(self):
+        super().__init__('turtle_commander')
+        self.shape_sub = self.create_subscription(String, 'shape', self.shape_callback, 10)
+        self.cmd_pub = self.create_publisher(Twist, '/turtle1/cmd_vel', 10)
+        self.pose_sub = self.create_subscription(Pose, '/turtle1/pose', self.pose_callback, 10)
+
+        self.get_logger().info('Turtle Commander ready!')
+        self.current_pose = None
+
+        # Threading control
+        self._lock = threading.Lock()
+        self.current_shape = None
+        self._stop_requested = False
+        self._runner_thread = None
+
+        # tuning
+        self.linear_k = 1.5   # proportional gain for linear velocity
+        self.angular_k = 6.0  # proportional gain for angular velocity
+        self.max_linear = 2.0
+        self.max_angular = 6.0
+
+    def pose_callback(self, msg: Pose):
+        self.current_pose = msg
+
+    def shape_callback(self, msg: String):
+        shape_name = msg.data.strip().lower()
+        if not shape_name:
+            return
+        self.get_logger().info(f'Received shape: {shape_name}')
+        with self._lock:
+            # stop current runner (if any)
+            self._stop_requested = True
+            if self._runner_thread and self._runner_thread.is_alive():
+                # let thread notice stop and finish
+                self._runner_thread.join(timeout=1.0)
+            self._stop_requested = False
+            self.current_shape = shape_name
+            # start a new thread to execute shape so callback returns quickly
+            self._runner_thread = threading.Thread(target=self.run_shape, args=(shape_name,), daemon=True)
+            self._runner_thread.start()
+
+    def run_shape(self, shape_name: str):
+        pts = self.generate_shape_points(shape_name)
+        if not pts:
+            self.get_logger().warn(f'Unknown shape: {shape_name}')
+            return
+        self.get_logger().info('Moving forward...')
+
+        for (x, y) in pts:
+            with self._lock:
+                if self._stop_requested:
+                    self.get_logger().info('Shape execution interrupted by new command.')
+                    return
+            # drive to (x,y)
+            self.drive_to_point(x, y)
+        self.get_logger().info('Done test!')
+
+    def generate_shape_points(self, name: str, steps=600):
+        """
+        Generate list of (x,y) points in WORLD coordinates (0..11) for the requested shape.
+        Uses internal parametric equations, normalizes them to -1..1, then scales/centers.
+        """
+        name = name.lower()
+        tlist = [i * (2 * math.pi) / steps for i in range(steps + 1)]
+
+        # produce raw x,y in some natural coordinate scale (centered at origin)
+        raw = []
+        if name == 'clover':
+            # 4-leaf clover: r = cos(2t) (rose curve with k=2) scaled by a
+            a = 1.0
+            for t in tlist:
+                r = a * math.cos(2 * t)
+                x = r * math.cos(t)
+                y = r * math.sin(t)
+                raw.append((x, y))
+        elif name == 'heart':
+            # classic heart param. (scaled): x = 16 sin^3 t, y = 13 cos t - 5 cos 2t - 2 cos 3t - cos 4t
+            for t in tlist:
+                x = 16 * (math.sin(t) ** 3)
+                y = 13 * math.cos(t) - 5 * math.cos(2 * t) - 2 * math.cos(3 * t) - math.cos(4 * t)
+                raw.append((x, y))
+        elif name == 'spiral':
+            # Archimedean spiral r = a + b*t
+            a = 0.1
+            b = 0.15
+            # use more turns
+            tlist_spiral = [i * (6 * math.pi) / steps for i in range(steps + 1)]
+            for t in tlist_spiral:
+                r = a + b * t
+                x = r * math.cos(t)
+                y = r * math.sin(t)
+                raw.append((x, y))
+        else:
+            return []
+
+        # normalize raw points to fit into [-1, 1] bounding box (keeping aspect)
+        xs = [p[0] for p in raw]
+        ys = [p[1] for p in raw]
+        xmin, xmax = min(xs), max(xs)
+        ymin, ymax = min(ys), max(ys)
+
+        # if degenerate, avoid divide by zero
+        width = xmax - xmin if xmax != xmin else 1.0
+        height = ymax - ymin if ymax != ymin else 1.0
+        scale = max(width, height) / 2.0  # half-size
+        # target half-size in world units: leave margin of 1.0 around edges
+        target_half = (WORLD_MAX - WORLD_MIN) / 2.0 - 1.0
+        if target_half <= 0.5:
+            target_half = (WORLD_MAX - WORLD_MIN) / 2.0 * 0.8
+
+        # map to world coords
+        pts_world = []
+        for (x, y) in raw:
+            # normalize to [-1, 1]
+            nx = (x - (xmin + xmax) / 2.0) / scale
+            ny = (y - (ymin + ymax) / 2.0) / scale
+            # scale to target_half and center at world center
+            wx = WORLD_CENTER_X + nx * target_half
+            wy = WORLD_CENTER_Y + ny * target_half
+            # clamp to world bounds to avoid drawing outside canvas
+            wx = clamp(wx, WORLD_MIN + 0.01, WORLD_MAX - 0.01)
+            wy = clamp(wy, WORLD_MIN + 0.01, WORLD_MAX - 0.01)
+            pts_world.append((wx, wy))
+        return pts_world
+
+    def drive_to_point(self, x_target, y_target, tolerance=0.08, rate_hz=30):
+        """
+        Simple P-controller: compute desired heading to target and move forward while correcting heading.
+        This is naive but works fine for turtlesim's low-order dynamics.
+        """
+        r = self.create_rate(rate_hz)
+        while rclpy.ok():
+            if self.current_pose is None:
+                # wait for pose
+                time.sleep(0.02)
+                continue
+
+            # check if a new shape was requested
+            with self._lock:
+                if self._stop_requested:
+                    # stop movement immediately
+                    self.publish_twist(0.0, 0.0)
+                    return
+
+            dx = x_target - self.current_pose.x
+            dy = y_target - self.current_pose.y
+            dist = math.hypot(dx, dy)
+            if dist <= tolerance:
+                # reached
+                self.publish_twist(0.0, 0.0)
+                return
+
+            desired_theta = math.atan2(dy, dx)
+            # normalize angles to -pi..pi
+            angle_err = self.normalize_angle(desired_theta - self.current_pose.theta)
+
+            linear = clamp(self.linear_k * dist, 0.0, self.max_linear)
+            angular = clamp(self.angular_k * angle_err, -self.max_angular, self.max_angular)
+
+            # If angle error large, prioritize rotation (reduce linear velocity)
+            if abs(angle_err) > 0.5:
+                linear *= 0.2
+
+            self.publish_twist(linear, angular)
+            r.sleep()
+
+    def publish_twist(self, lin, ang):
+        tmsg = Twist()
+        tmsg.linear.x = float(lin)
+        tmsg.angular.z = float(ang)
+        self.cmd_pub.publish(tmsg)
+
+    def normalize_angle(self, a):
+        while a > math.pi:
+            a -= 2 * math.pi
+        while a < -math.pi:
+            a += 2 * math.pi
+        return a
+
+    # helper to build a rate-like object without spinning
+    class Rate:
+        def __init__(self, hz):
+            self.delay = 1.0 / hz
+        def sleep(self):
+            time.sleep(self.delay)
+
+    def create_rate(self, hz):
+        return TurtleCommander.Rate(hz)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = TurtleCommander()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node.get_logger().info('Shutting down...')
+    finally:
+        # ensure turtle stops
+        node.publish_twist(0.0, 0.0)
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
