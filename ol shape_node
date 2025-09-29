@@ -1,0 +1,32 @@
+...riamr/ros2_ws/src/turtlesim_shapes/turtlesim_shapes/shape_node.py        #!/usr/bin/env python3
+
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import String
+
+class ShapePublisher(Node):
+    def __init__(self):
+        super().__init__('shape_publisher')
+        self.publisher = self.create_publisher(String, '/shape', 10)
+        self.get_logger().info("ShapePublisher ready! Use this node to send>
+    def send_shape(self, shape_name: str):
+        msg = String()
+        msg.data = shape_name
+        self.publisher.publish(msg)
+        self.get_logger().info(f"Sent shape command: {shape_name}")
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = ShapePublisher()
+
+    # Example: automatically send a shape
+    import time
+    time.sleep(2)  # wait a bit for the publisher to connect
+    node.send_shape("clover")   # change to "heart" or "infinity"
+
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
